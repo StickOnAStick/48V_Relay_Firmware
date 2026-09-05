@@ -41,6 +41,7 @@ esp-println = { version = "0.17.0", features = ["esp32", "log-04"] }
 # for more networking protocol support see https://crates.io/crates/edge-net
 bt-hci = "0.8.0"
 embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-sync = "0.7.2"
 embassy-time = { version = "0.5.0", features = ["log"] }
 esp-radio = { version = "0.18.0", features = [
   "ble",
@@ -68,6 +69,8 @@ trouble-host = { version = "0.6.0", features = ["gatt"] }
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
+embassy-net-wiznet = "0.3.0"
+embedded-hal-bus = { version = "0.3.0", features = ["async"] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

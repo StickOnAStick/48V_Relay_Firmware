@@ -10,9 +10,10 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
 use log::info;
+use relay_board_five_chn::board;
+use relay_board_five_chn::network;
+use relay_board_five_chn::{api, relay};
 
 extern crate alloc;
 
@@ -31,39 +32,29 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-    peripherals.GPIO0
-    // The following pins are used to bootstrap the chip. They are available
-    // for use, but check the datasheet of the module for more information on them.
-    // - GPIO0 -- RESET
-    // - GPIO2 -- NC
-    // - GPIO5 -- NC
-    // - GPIO12 -- JTAG TDI
-    // - GPIO15 -- JTAG TDO
-    // These GPIO pins are in use by some feature of the module and should not be used.
-    let _ = peripherals.GPIO6;
-    let _ = peripherals.GPIO7;
-    let _ = peripherals.GPIO8;
-    let _ = peripherals.GPIO9;
-    let _ = peripherals.GPIO10;
-    let _ = peripherals.GPIO11;
-    let _ = peripherals.GPIO16;
-    let _ = peripherals.GPIO20;
+    let board: board::Board = board::init();
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
     // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    esp_rtos::start(board.rtos.rtos_timer, board.rtos.int0);
+
+    // This task keeps exclusive ownership of the physical relay GPIO pins.
+    // API and future board-safety tasks receive only the returned command handle.
+    let relay_control = relay::start(board.relays, spawner);
+
+    let stack = network::w5500::start(board.w5500, spawner).await;
 
     info!("Embassy initialized!");
+    info!("Waiting for Ethernet link and DHCP configuration...");
+    stack.wait_config_up().await;
+    info!("Ethernet is configured");
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    // Four workers allow four HTTP requests to be processed concurrently.
+    for _ in 0..4 {
+        spawner.spawn(api::http_server_task(stack, relay_control).unwrap());
+    }
 
     loop {
         info!("Hello world!");
