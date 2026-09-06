@@ -8,14 +8,23 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
+use esp_hal::system::Stack as CoreStack;
+use esp_rtos::embassy::Executor;
 use log::info;
 use relay_board_five_chn::board;
 use relay_board_five_chn::network;
-use relay_board_five_chn::{api, relay};
+use relay_board_five_chn::tasks::{api, relay};
+use static_cell::StaticCell;
 
 extern crate alloc;
+
+// Core 1 needs its own CPU stack and Embassy executor. 8 KiB is a deliberate
+// starting budget for the relay task and the RTOS core-1 thread; revise it
+// after measuring real stack usage with the final firmware.
+const SECOND_CORE_STACK_BYTES: usize = 8 * 1024;
+static SECOND_CORE_STACK: StaticCell<CoreStack<SECOND_CORE_STACK_BYTES>> = StaticCell::new();
+static SECOND_CORE_EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -32,19 +41,34 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::logger::init_logger_from_env();
 
-    let board: board::Board = board::init();
+    let board::Board {
+        w5500,
+        relays,
+        rtos,
+    } = board::init();
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
     // COEX needs more RAM - so we've added some more
     esp_alloc::heap_allocator!(size: 64 * 1024);
 
-    esp_rtos::start(board.rtos.rtos_timer, board.rtos.int0);
+    // Core 0 runs the Embassy main task, W5500 runner, TCP/IP stack, and API.
+    esp_rtos::start(rtos.rtos_timer, rtos.int0);
 
-    // This task keeps exclusive ownership of the physical relay GPIO pins.
-    // API and future board-safety tasks receive only the returned command handle.
-    let relay_control = relay::start(board.relays, spawner);
+    // Core 1 runs the GPIO-owning relay task. The `RelayControl` is only a
+    // channel handle, so it may safely be copied to the core-0 API workers.
+    let relay_control = relay::control();
+    let second_core_stack = SECOND_CORE_STACK.init(CoreStack::new());
+    esp_rtos::start_second_core(
+        rtos.cpu_ctrl,
+        rtos.int1,
+        second_core_stack,
+        move || {
+            let executor = SECOND_CORE_EXECUTOR.init(Executor::new());
+            executor.run(|core1_spawner| relay::start(relays, core1_spawner));
+        },
+    );
 
-    let stack = network::w5500::start(board.w5500, spawner).await;
+    let stack = network::w5500::start(w5500, spawner).await;
 
     info!("Embassy initialized!");
     info!("Waiting for Ethernet link and DHCP configuration...");
@@ -56,9 +80,10 @@ async fn main(spawner: Spawner) -> ! {
         spawner.spawn(api::http_server_task(stack, relay_control).unwrap());
     }
 
+    // All application work is now performed by spawned tasks. Keep the main
+    // task alive without consuming CPU or emitting generator-example logs.
     loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+        core::future::pending::<()>().await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
