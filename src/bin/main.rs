@@ -15,7 +15,7 @@ use log::info;
 use relay_board_five_chn::board;
 use relay_board_five_chn::network;
 use relay_board_five_chn::tasks::{api, relay};
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 extern crate alloc;
 
@@ -23,7 +23,9 @@ extern crate alloc;
 // starting budget for the relay task and the RTOS core-1 thread; revise it
 // after measuring real stack usage with the final firmware.
 const SECOND_CORE_STACK_BYTES: usize = 8 * 1024;
-static SECOND_CORE_STACK: StaticCell<CoreStack<SECOND_CORE_STACK_BYTES>> = StaticCell::new();
+// Initialize in static storage so startup never needs an 8 KiB stack temporary.
+static SECOND_CORE_STACK: ConstStaticCell<CoreStack<SECOND_CORE_STACK_BYTES>> =
+    ConstStaticCell::new(CoreStack::new());
 static SECOND_CORE_EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -57,7 +59,7 @@ async fn main(spawner: Spawner) -> ! {
     // Core 1 runs the GPIO-owning relay task. The `RelayControl` is only a
     // channel handle, so it may safely be copied to the core-0 API workers.
     let relay_control = relay::control();
-    let second_core_stack = SECOND_CORE_STACK.init(CoreStack::new());
+    let second_core_stack = SECOND_CORE_STACK.take();
     esp_rtos::start_second_core(
         rtos.cpu_ctrl,
         rtos.int1,
@@ -74,6 +76,9 @@ async fn main(spawner: Spawner) -> ! {
     info!("Waiting for Ethernet link and DHCP configuration...");
     stack.wait_config_up().await;
     info!("Ethernet is configured");
+    if let Some(config) = stack.config_v4() {
+        info!("Relay board: http://{}/ (gateway: {:?})", config.address.address(), config.gateway);
+    }
 
     // Four workers allow four HTTP requests to be processed concurrently.
     for _ in 0..4 {

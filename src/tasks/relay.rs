@@ -23,6 +23,7 @@ static RELAY_STATE: AtomicU32 = AtomicU32::new(0);
 #[derive(Clone, Copy)]
 enum RelayCommand {
     Set { index: usize, on: bool },
+    AllOn,
     AllOff,
 }
 
@@ -50,6 +51,11 @@ impl RelayControl {
 
         COMMANDS.send(RelayCommand::Set { index, on }).await;
         Ok(())
+    }
+
+    /// Queue one command to turn every relay on.
+    pub async fn all_on(&self) {
+        COMMANDS.send(RelayCommand::AllOn).await;
     }
 
     /// Queue a safe-state request for every relay.
@@ -99,6 +105,10 @@ async fn relay_task(mut relays: RelayBank<RELAY_COUNT>) -> ! {
                         RELAY_STATE.fetch_and(!bit, Ordering::AcqRel);
                     }
                 }
+            }
+            RelayCommand::AllOn => {
+                relays.all_on();
+                RELAY_STATE.store((1_u32 << RELAY_COUNT) - 1, Ordering::Release);
             }
             RelayCommand::AllOff => {
                 relays.all_off();

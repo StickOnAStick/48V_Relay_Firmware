@@ -1,20 +1,20 @@
 [[board]]
 binary = "relay-5"
-relay_pins = [25, 26, 27, 32, 33]
+relay_pins = [16, 17, 18, 19, 23]
 
 [board.w5500]
 spi = 2
-sclk = 18
-mosi = 23
-miso = 19
-cs = 21
-int = 22
+sclk = 27
+mosi = 25
+miso = 26
+cs = 33
+int = 32
 reset = 4
 
-[[board]]
-binary = "relay-10"
-relay_pins = [25, 26, 27, 32, 33, 13, 14, 17, 18, 19]
+# [[board]]
+# binary = "relay-10"
+# relay_pins = [25, 26, 27, 32, 33, 13, 14, 17, 18, 19]
 
-[[board]]
-binary = "relay-16"
-relay_pins = [/* sixteen GPIO numbers */]
+# [[board]]
+# binary = "relay-16"
+# relay_pins = [/* sixteen GPIO numbers */]

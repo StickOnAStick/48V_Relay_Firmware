@@ -16,7 +16,7 @@ use esp_hal::{
     gpio::{Input, Output},
     spi::master::Spi,
 };
-use static_cell::StaticCell;
+use static_cell::ConstStaticCell;
 
 use crate::board::W5500Hardware;
 
@@ -24,12 +24,14 @@ use crate::board::W5500Hardware;
 ///
 /// Each entry costs approximately one Ethernet MTU of RAM. Four receive and
 /// four transmit entries are a reasonable starting point for this controller.
-static W5500_STATE: StaticCell<State<4, 4>> =
-    StaticCell::new();
+// Construct the packet buffers in static storage, avoiding a large startup
+// stack temporary when the async main task first runs.
+static W5500_STATE: ConstStaticCell<State<4, 4>> =
+    ConstStaticCell::new(State::new());
 
 /// Four API sockets plus DHCP and one spare socket.
-static NET_RESOURCES: StaticCell<StackResources<6>> =
-    StaticCell::new();
+static NET_RESOURCES: ConstStaticCell<StackResources<6>> =
+    ConstStaticCell::new(StackResources::new());
 
 // A single W5500 is the exclusive user of this SPI bus. The wrapper supplies
 // chip-select handling required by the W5500's `SpiDevice` interface.
@@ -90,7 +92,7 @@ pub async fn start(
 
     let (device, w5500_runner) = embassy_net_wiznet::new::<4, 4, W5500, _, _, _>(
         mac,
-        W5500_STATE.init(State::new()),
+        W5500_STATE.take(),
         spi_device,
         int,
         reset,
@@ -104,7 +106,7 @@ pub async fn start(
     let (stack, net_runner) = embassy_net::new(
         device,
         Config::dhcpv4(Default::default()),
-        NET_RESOURCES.init(StackResources::new()),
+        NET_RESOURCES.take(),
         seed,
     );
 

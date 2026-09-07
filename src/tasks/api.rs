@@ -4,7 +4,9 @@
 //! TCP socket and asks the relay controller to apply validated commands.
 
 use embassy_net::{Stack, tcp::TcpSocket};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write;
+use log::{info, warn};
 
 use crate::{board::RELAY_COUNT, tasks::relay::RelayControl};
 
@@ -41,40 +43,116 @@ pub async fn http_server_task(stack: Stack<'static>, relays: RelayControl) -> ! 
     // `pool_size = 4` permits four such workers to be spawned.
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
+    socket.set_timeout(Some(Duration::from_secs(10)));
+
     loop {
-        if socket.accept(HTTP_PORT).await.is_err() {
-            continue; // TODO: Don't silently drop requests.
+        if let Err(error) = socket.accept(HTTP_PORT).await {
+            warn!("HTTP accept failed: {:?}", error);
+            recycle_socket(&mut socket).await;
+            Timer::after_millis(50).await;
+            continue;
         }
+        let peer = socket.remote_endpoint();
+        info!("HTTP connection: {:?}", peer);
 
-        let mut request_buffer = [0_u8; REQUEST_BUFFER_SIZE];
-        let header_byte_count = read_http_headers(&mut socket, &mut request_buffer).await;
-
-        let response = match header_byte_count {
-            Some(byte_count) => route(&request_buffer[..byte_count], relays).await,
-            None => Response::BadRequest,
-        };
-
-        match response {
-            Response::Html => respond(&mut socket, b"200 OK", b"text/html; charset=utf-8", INDEX_HTML).await,
-            Response::RelayState => {
-                let mut body = [0_u8; 96];
-                let body_len = write_relay_state(&mut body, relays.state_mask());
-                respond(&mut socket, b"200 OK", b"application/json", &body[..body_len]).await;
-            }
-            Response::CommandAccepted => {
-                respond(&mut socket, b"202 Accepted", b"application/json", b"{\"accepted\":true}").await;
-            }
-            Response::BadRequest => {
-                respond(&mut socket, b"400 Bad Request", b"application/json", b"{\"error\":\"invalid relay request\"}").await;
-            }
-            Response::NotFound => {
-                respond(&mut socket, b"404 Not Found", b"application/json", b"{\"error\":\"not found\"}").await;
-            }
+        match with_timeout(Duration::from_secs(10), serve_request(&mut socket, relays)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("HTTP {:?}: I/O error: {:?}", peer, error),
+            Err(_) => warn!("HTTP {:?}: request/response timed out", peer),
         }
-
-        let _ = socket.flush().await;
-        socket.close();
+        recycle_socket(&mut socket).await;
     }
+}
+
+/// Let FIN complete before listening again. An immediate accept after close
+/// returns InvalidState and can spin forever, starving the network runner.
+async fn recycle_socket(socket: &mut TcpSocket<'_>) {
+    socket.close();
+    let closed = with_timeout(Duration::from_secs(2), async {
+        socket.flush().await?;
+        while !matches!(
+            socket.state(),
+            embassy_net::tcp::State::Closed | embassy_net::tcp::State::TimeWait
+        ) {
+            Timer::after_millis(10).await;
+        }
+        Ok::<(), embassy_net::tcp::Error>(())
+    })
+    .await;
+    if !matches!(closed, Ok(Ok(()))) {
+        warn!("HTTP close incomplete; aborting socket");
+    }
+    socket.abort();
+    let _ = with_timeout(Duration::from_secs(1), socket.flush()).await;
+}
+
+async fn serve_request(
+    socket: &mut TcpSocket<'_>,
+    relays: RelayControl,
+) -> Result<(), embassy_net::tcp::Error> {
+    let mut request_buffer = [0_u8; REQUEST_BUFFER_SIZE];
+    let header_byte_count = read_http_headers(socket, &mut request_buffer).await;
+    let response = match header_byte_count {
+        Some(byte_count) => {
+            let request = &request_buffer[..byte_count];
+            if let Some(line) = parse_http_request_line(request) {
+                info!(
+                    "HTTP {:?} request: {:?} {:?}",
+                    socket.remote_endpoint(),
+                    core::str::from_utf8(line.method).unwrap_or("<invalid UTF-8>"),
+                    core::str::from_utf8(line.target).unwrap_or("<invalid UTF-8>")
+                );
+            } else {
+                warn!("HTTP malformed request line");
+            }
+            route(request, relays).await
+        }
+        None => {
+            warn!("HTTP incomplete, oversized, or unreadable headers");
+            Response::BadRequest
+        }
+    };
+
+    match response {
+        Response::Html => {
+            respond(socket, b"200 OK", b"text/html; charset=utf-8", INDEX_HTML).await?
+        }
+        Response::RelayState => {
+            let mut body = [0_u8; 96];
+            let body_len = write_relay_state(&mut body, relays.state_mask());
+            respond(socket, b"200 OK", b"application/json", &body[..body_len]).await?;
+        }
+        Response::CommandAccepted => {
+            respond(
+                socket,
+                b"202 Accepted",
+                b"application/json",
+                b"{\"accepted\":true}",
+            )
+            .await?
+        }
+        Response::BadRequest => {
+            respond(
+                socket,
+                b"400 Bad Request",
+                b"application/json",
+                b"{\"error\":\"invalid relay request\"}",
+            )
+            .await?
+        }
+        Response::NotFound => {
+            respond(
+                socket,
+                b"404 Not Found",
+                b"application/json",
+                b"{\"error\":\"not found\"}",
+            )
+            .await?
+        }
+    }
+    socket.flush().await?;
+    info!("HTTP response acknowledged: {:?}", socket.remote_endpoint());
+    Ok(())
 }
 
 enum Response {
@@ -99,10 +177,7 @@ async fn read_http_headers(socket: &mut TcpSocket<'_>, buffer: &mut [u8]) -> Opt
         }
         received_byte_count += bytes_read;
 
-        if contains_bytes(
-            &buffer[..received_byte_count],
-            END_OF_HTTP_HEADERS,
-        ) {
+        if contains_bytes(&buffer[..received_byte_count], END_OF_HTTP_HEADERS) {
             return Some(received_byte_count);
         }
     }
@@ -121,14 +196,25 @@ async fn route(request: &[u8], relays: RelayControl) -> Response {
     if request_line.method == HTTP_GET && request_line.target == b"/" {
         return Response::Html;
     }
-    if request_line.method == HTTP_GET && request_line.target == b"/api/relays" {
+    if request_line.method == HTTP_GET
+        && matches!(request_line.target, b"/api/relays" | b"/api/relays/")
+    {
         return Response::RelayState;
     }
 
     if request_line.method != HTTP_POST {
         return Response::NotFound;
     }
-    let Some(path_after_relay_prefix) = request_line.target.strip_prefix(RELAY_API_PATH_PREFIX) else {
+    if request_line.target == b"/api/relays/all/on" {
+        relays.all_on().await;
+        return Response::CommandAccepted;
+    }
+    if request_line.target == b"/api/relays/all/off" {
+        relays.all_off().await;
+        return Response::CommandAccepted;
+    }
+    let Some(path_after_relay_prefix) = request_line.target.strip_prefix(RELAY_API_PATH_PREFIX)
+    else {
         return Response::NotFound;
     };
     let Some((index, action_path)) = parse_relay_target(path_after_relay_prefix) else {
@@ -217,13 +303,24 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-async fn respond(socket: &mut TcpSocket<'_>, status: &[u8], content_type: &[u8], body: &[u8]) {
-    let _ = socket.write_all(b"HTTP/1.1 ").await;
-    let _ = socket.write_all(status).await;
-    let _ = socket.write_all(b"\r\nContent-Type: ").await;
-    let _ = socket.write_all(content_type).await;
-    let _ = socket.write_all(b"\r\nConnection: close\r\n\r\n").await;
-    let _ = socket.write_all(body).await;
+async fn respond(
+    socket: &mut TcpSocket<'_>,
+    status: &[u8],
+    content_type: &[u8],
+    body: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    info!(
+        "HTTP {:?} response: {}",
+        socket.remote_endpoint(),
+        core::str::from_utf8(status).unwrap_or("<invalid status>")
+    );
+    socket.write_all(b"HTTP/1.1 ").await?;
+    socket.write_all(status).await?;
+    socket.write_all(b"\r\nContent-Type: ").await?;
+    socket.write_all(content_type).await?;
+    socket.write_all(b"\r\nConnection: close\r\n\r\n").await?;
+    socket.write_all(body).await?;
+    Ok(())
 }
 
 fn write_relay_state(buffer: &mut [u8], mask: u32) -> usize {

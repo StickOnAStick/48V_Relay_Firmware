@@ -61,6 +61,16 @@ impl <const N: usize> RelayBank<N> {
         Ok(())
     }
 
+    pub fn all_on(&mut self) {
+        for pin in &mut self.pins {
+            if self.active_high {
+                pin.set_high();
+            } else {
+                pin.set_low();
+            }
+        }
+    }
+
     pub fn all_off(&mut self) {
         for pin in &mut self.pins {
             if self.active_high {
@@ -98,7 +108,7 @@ pub fn init() -> Board {
     let _ = p.GPIO9;
     let _ = p.GPIO10;
     let _ = p.GPIO11;
-    let _ = p.GPIO16;
+    // let _ = p.GPIO16; - Only an issue if you have an R variant wroom 32 with QSPI ram, in which you'll need to pull up this pin.
     let _ = p.GPIO20;
 
     let w5500 = W5500Hardware{
